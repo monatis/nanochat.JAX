@@ -162,13 +162,28 @@ def muon(
             update = -lr_scaled * g_orth - wd_term
             return update, new_mom, new_sec_mom
 
-        new_updates, new_mom_buf, new_sec_mom = jax.tree.map(
+        # 1. Map over the tree. This returns a single PyTree where every leaf
+        # is a 3-element tuple: (update, new_mom, new_sec_mom)
+        results_tree = jax.tree.map(
             _muon_update,
             updates,
             momentum_buf,
             second_moment,
             params if params is not None else jax.tree.map(jnp.zeros_like, updates),
-            is_leaf=lambda x: isinstance(x, jnp.ndarray) or hasattr(x, "shape"),
+        )
+
+        # 2. Tell JAX not to traverse inside our 3-element result tuples
+        is_result_tuple = lambda x: isinstance(x, tuple) and len(x) == 3
+
+        # 3. Unzip the tree of tuples into three separate PyTrees
+        new_updates = jax.tree.map(
+            lambda x: x[0], results_tree, is_leaf=is_result_tuple
+        )
+        new_mom_buf = jax.tree.map(
+            lambda x: x[1], results_tree, is_leaf=is_result_tuple
+        )
+        new_sec_mom = jax.tree.map(
+            lambda x: x[2], results_tree, is_leaf=is_result_tuple
         )
 
         return new_updates, (new_mom_buf, new_sec_mom)
