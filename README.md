@@ -33,7 +33,23 @@ uv sync --group dev
 The entire pipeline is designed for TPU VMs. Boot up a TPU node (e.g., v5p-8) and run:
 
 ```bash
-# Provision a TPU (see tpu-builders-guide.md for details)
+# Provision a TPU.
+gcloud alpha compute tpus queued-resources create tpu-builder-queue \
+    --zone=us-east5-a \
+    --accelerator-type=v5p-8 \
+    --runtime-version=v2-alpha-tpuv5 \
+    --node-id=my-tpu-node \
+    --provisioning-model=flex-start \
+    --max-run-duration=4h \
+    --valid-until-duration=4h \
+    --labels=purpose=flex-start # Fix to 
+
+
+# Check the request status:
+
+gcloud alpha compute tpus queued-resources describe tpu-builder-queue \
+    --zone us-east5-a
+
 # Once on the TPU VM:
 bash runs/tpu_smoke_test.sh   # Verify everything is working
 bash runs/speedrun.sh         # Kick off the GPT-2 speedrun
