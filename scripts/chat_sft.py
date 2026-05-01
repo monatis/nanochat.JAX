@@ -20,10 +20,20 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 from flax import nnx
+import optax
 
-from nanochat.common import (compute_init, compute_cleanup, print0, DummyWandb,
-                              get_base_dir, get_peak_flops, get_device_name,
-                              COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, create_mesh)
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    DummyWandb,
+    get_base_dir,
+    get_peak_flops,
+    get_device_name,
+    COMPUTE_DTYPE,
+    COMPUTE_DTYPE_REASON,
+    create_mesh,
+)
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.loss_eval import evaluate_bpb
@@ -42,33 +52,114 @@ from tasks.spellingbee import SimpleSpelling, SpellingBee
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) (JAX/TPU)")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb)")
+parser.add_argument(
+    "--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb)"
+)
 # Model loading
-parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
-parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument(
+    "--model-tag", type=str, default=None, help="model tag to load from"
+)
+parser.add_argument(
+    "--model-step", type=int, default=None, help="model step to load from"
+)
 # Training horizon
-parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
+parser.add_argument(
+    "--num-iterations",
+    type=int,
+    default=-1,
+    help="number of optimization steps (-1 = full epoch)",
+)
 # Batch sizes
-parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
-parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit)")
-parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit)")
+parser.add_argument(
+    "--max-seq-len",
+    type=int,
+    default=None,
+    help="max context length (default: inherit from pretrain)",
+)
+parser.add_argument(
+    "--device-batch-size",
+    type=int,
+    default=None,
+    help="per-device batch size (default: inherit)",
+)
+parser.add_argument(
+    "--total-batch-size",
+    type=int,
+    default=None,
+    help="total batch size in tokens (default: inherit)",
+)
 # Optimization
-parser.add_argument("--embedding-lr", type=float, default=None, help="LR for embeddings (default: inherit)")
-parser.add_argument("--unembedding-lr", type=float, default=None, help="LR for lm_head (default: inherit)")
-parser.add_argument("--matrix-lr", type=float, default=None, help="LR for matrix params (default: inherit)")
-parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
+parser.add_argument(
+    "--embedding-lr",
+    type=float,
+    default=None,
+    help="LR for embeddings (default: inherit)",
+)
+parser.add_argument(
+    "--unembedding-lr",
+    type=float,
+    default=None,
+    help="LR for lm_head (default: inherit)",
+)
+parser.add_argument(
+    "--matrix-lr",
+    type=float,
+    default=None,
+    help="LR for matrix params (default: inherit)",
+)
+parser.add_argument(
+    "--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR"
+)
+parser.add_argument(
+    "--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup"
+)
+parser.add_argument(
+    "--warmdown-ratio",
+    type=float,
+    default=0.5,
+    help="ratio of iterations for LR warmdown",
+)
+parser.add_argument(
+    "--final-lr-frac",
+    type=float,
+    default=0.0,
+    help="final LR as fraction of initial LR",
+)
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE every N steps (-1 = disable)")
-parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task")
-parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task")
+parser.add_argument(
+    "--eval-every",
+    type=int,
+    default=200,
+    help="evaluate val bpb every N steps (-1 = disable)",
+)
+parser.add_argument(
+    "--eval-tokens",
+    type=int,
+    default=40 * 524288,
+    help="number of tokens to evaluate val loss on",
+)
+parser.add_argument(
+    "--chatcore-every",
+    type=int,
+    default=200,
+    help="evaluate ChatCORE every N steps (-1 = disable)",
+)
+parser.add_argument(
+    "--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task"
+)
+parser.add_argument(
+    "--chatcore-max-sample",
+    type=int,
+    default=24,
+    help="max problems per generative task",
+)
 # Data mixture
-parser.add_argument("--mmlu-epochs", type=int, default=3, help="epochs of MMLU in training mixture")
-parser.add_argument("--gsm8k-epochs", type=int, default=4, help="epochs of GSM8K in training mixture")
+parser.add_argument(
+    "--mmlu-epochs", type=int, default=3, help="epochs of MMLU in training mixture"
+)
+parser.add_argument(
+    "--gsm8k-epochs", type=int, default=4, help="epochs of GSM8K in training mixture"
+)
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -80,7 +171,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # Device mesh
 mesh = create_mesh()
-data_sharding = NamedSharding(mesh, P('data', None))
+data_sharding = NamedSharding(mesh, P("data", None))
 
 device_name = get_device_name()
 peak_flops = get_peak_flops(device_name)
@@ -88,20 +179,26 @@ print0(f"Device: {device_name} | Peak FLOPS (BF16): {peak_flops:.2e}")
 
 # wandb
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+wandb_run = (
+    DummyWandb()
+    if use_dummy_wandb
+    else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+)
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(
+    "base", phase="train", model_tag=args.model_tag, step=args.model_step
+)
 
 # Inherit training hyperparameters from pretrained checkpoint
 pretrain_user_config = meta.get("user_config", {})
 for name, fallback, source in [
-    ("max_seq_len",       2048,  meta),
-    ("device_batch_size", 32,    meta),
-    ("total_batch_size",  524288, meta),
-    ("embedding_lr",      0.3,   pretrain_user_config),
-    ("unembedding_lr",    0.004, pretrain_user_config),
-    ("matrix_lr",         0.02,  pretrain_user_config),
+    ("max_seq_len", 2048, meta),
+    ("device_batch_size", 32, meta),
+    ("total_batch_size", 524288, meta),
+    ("embedding_lr", 0.3, pretrain_user_config),
+    ("unembedding_lr", 0.004, pretrain_user_config),
+    ("matrix_lr", 0.02, pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -121,14 +218,15 @@ token_bytes = get_token_bytes()
 
 # Initialize Optimizer (SFT continues with zero weight decay)
 optim_config = {
-    'muon_lr': args.matrix_lr * args.init_lr_frac,
-    'muon_wd': 0.0,
-    'adamw_embed_lr': args.embedding_lr * args.init_lr_frac,
-    'adamw_lm_head_lr': args.unembedding_lr * args.init_lr_frac,
-    'adamw_scalars_lr': 0.5 * args.init_lr_frac,
+    "muon_lr": args.matrix_lr * args.init_lr_frac,
+    "muon_wd": 0.0,
+    "adamw_embed_lr": args.embedding_lr * args.init_lr_frac,
+    "adamw_lm_head_lr": args.unembedding_lr * args.init_lr_frac,
+    "adamw_scalars_lr": 0.5 * args.init_lr_frac,
 }
+
 tx = build_optimizer(model, optim_config)
-params = nnx.state(model, nnx.Param)
+graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 opt_state = tx.init(params)
 
 # SFT data mixture
@@ -145,16 +243,19 @@ train_tasks = [
 ]
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows")
-val_dataset = TaskMixture([
-    SmolTalk(split="test"),
-    MMLU(subset="all", split="test", stop=5200),
-    GSM8K(subset="main", split="test", stop=420),
-])
+val_dataset = TaskMixture(
+    [
+        SmolTalk(split="test"),
+        MMLU(subset="all", split="test", stop=5200),
+        GSM8K(subset="main", split="test", stop=420),
+    ]
+)
 
 # Global state for data generator
 last_step = False
 approx_progress = 0.0
 current_epoch = 1
+
 
 def sft_data_generator_bos_bestfit(split, buffer_size=100):
     """BOS-aligned dataloader for SFT with bestfit-pad packing."""
@@ -243,13 +344,15 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
-                targets[i, content_len-1:] = -1
+                targets[i, content_len - 1 :] = -1
 
         yield inputs, targets
+
 
 train_loader = sft_data_generator_bos_bestfit("train")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
 progress = 0
+
 
 # LR schedule
 def get_lr_multiplier(progress):
@@ -261,22 +364,22 @@ def get_lr_multiplier(progress):
         decay = (progress - (1.0 - args.warmdown_ratio)) / args.warmdown_ratio
         return (1 - decay) * 1.0 + decay * args.final_lr_frac
 
+
 # JIT-compiled train step
 @jax.jit
-def train_step(model_state, opt_state, x, y):
-    graphdef = nnx.graphdef(model)
-    def loss_fn(params):
-        m = nnx.merge(graphdef, params)
-        return m(x, y, loss_reduction='mean')
-    loss, grads = jax.value_and_grad(loss_fn)(model_state)
-    updates, new_opt_state = tx.update(grads, opt_state, model_state)
-    import optax
-    new_model_state = optax.apply_updates(model_state, updates)
-    return loss, new_model_state, new_opt_state
+def train_step(p, r, opt, x, y):
+    def loss_fn(p_inner):
+        m = nnx.merge(graphdef, p_inner, r)
+        return m(x, targets=y, loss_reduction="mean")
+
+    loss, grads = jax.value_and_grad(loss_fn)(p)
+    updates, new_opt = tx.update(grads, opt, p)
+    new_params = optax.apply_updates(p, updates)
+    return loss, new_params, new_opt
+
 
 # -----------------------------------------------------------------------------
 # Training loop
-model_state = nnx.state(model, nnx.Param)
 min_val_bpb = float("inf")
 smooth_train_loss = 0
 ema_beta = 0.9
@@ -288,11 +391,13 @@ while True:
 
     # Save checkpoint at end
     if last_step:
-        nnx.update(model, model_state)
         output_dirname = args.model_tag if args.model_tag else f"d{depth}"
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
-            checkpoint_dir, step, model, opt_state,
+            checkpoint_dir,
+            step,
+            params,
+            opt_state,
             {
                 "step": step,
                 "val_bpb": min_val_bpb,
@@ -306,7 +411,7 @@ while True:
                     "window_pattern": model.config.window_pattern,
                 },
                 "user_config": user_config,
-            }
+            },
         )
 
     if last_step:
@@ -321,13 +426,14 @@ while True:
         x_np, y_np = next(train_loader)
         x = jax.device_put(jnp.array(x_np, dtype=jnp.int32), data_sharding)
         y = jax.device_put(jnp.array(y_np, dtype=jnp.int32), data_sharding)
-        loss, model_state, opt_state = train_step(model_state, opt_state, x, y)
+
+        loss, params, opt_state = train_step(params, rest, opt_state, x, y)
         accumulated_loss += float(loss)
         progress = max(progress, approx_progress)
 
     train_loss_f = accumulated_loss / grad_accum_steps
 
-    jax.block_until_ready(model_state)
+    jax.block_until_ready(params)
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
@@ -336,35 +442,43 @@ while True:
 
     # Logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
     mfu = 100 * flops_per_sec / (peak_flops * num_devices)
     if step > 10:
         total_training_time += dt
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f}% | epoch: {current_epoch}")
+    print0(
+        f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f}% | epoch: {current_epoch}"
+    )
 
     if step % 10 == 0:
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "train/loss": debiased_smooth_loss,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-        })
+        wandb_run.log(
+            {
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "train/loss": debiased_smooth_loss,
+                "train/dt": dt,
+                "train/tok_per_sec": tok_per_sec,
+                "train/mfu": mfu,
+            }
+        )
 
 # Final stats
-print0(f"Total training time: {total_training_time/60:.2f}m")
+print0(f"Total training time: {total_training_time / 60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
 from nanochat.report import get_report
-get_report().log(section="SFT", data=[
-    user_config,
-    {"Number of iterations": step, "Devices": num_devices},
-    {"Minimum validation bpb": min_val_bpb},
-])
+
+get_report().log(
+    section="SFT",
+    data=[
+        user_config,
+        {"Number of iterations": step, "Devices": num_devices},
+        {"Minimum validation bpb": min_val_bpb},
+    ],
+)
 
 wandb_run.finish()
 compute_cleanup()
