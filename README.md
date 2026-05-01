@@ -52,7 +52,7 @@ gcloud alpha compute tpus queued-resources describe tpu-builder-queue \
 
 # Once on the TPU VM:
 bash runs/tpu_smoke_test.sh   # Verify everything is working
-bash runs/speedrun.sh         # Kick off the GPT-2 speedrun
+bash runs/speedrun_tpu.sh         # Kick off the GPT-2 speedrun
 ```
 
 Once training is done, you can serve the chat UI:
