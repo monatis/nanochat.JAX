@@ -20,13 +20,14 @@ from flax import nnx
 
 from nanochat.common import print0, COMPUTE_DTYPE
 
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
     n_layer: int = 12
-    n_head: int = 6 # number of query heads
-    n_kv_head: int = 6 # number of key/value heads (GQA)
+    n_head: int = 6  # number of query heads
+    n_kv_head: int = 6  # number of key/value heads (GQA)
     n_embd: int = 768
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
@@ -42,9 +43,12 @@ def rms_norm(x):
 class Linear(nnx.Module):
     """Linear layer without bias. Weights stored in fp32 for optimizer precision,
     cast to compute dtype in forward pass."""
+
     def __init__(self, in_features: int, out_features: int, *, rngs: nnx.Rngs):
         # Initialize with zeros — actual init done by GPT.init_weights()
-        self.kernel = nnx.Param(jnp.zeros((out_features, in_features), dtype=jnp.float32))
+        self.kernel = nnx.Param(
+            jnp.zeros((out_features, in_features), dtype=jnp.float32)
+        )
         self.in_features = in_features
         self.out_features = out_features
 
@@ -87,7 +91,9 @@ def _compute_window_sizes(config):
     Returns list of ints: -1 means full context, positive int means window size.
     """
     pattern = config.window_pattern.upper()
-    assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
+    assert all(c in "SL" for c in pattern), (
+        f"Invalid window_pattern: {pattern}. Use only S and L."
+    )
     long_window = config.sequence_len
     short_window = -(-long_window // 4 // 128) * 128  # ceil to tile size
     char_to_window = {
@@ -132,7 +138,11 @@ class CausalSelfAttention(nnx.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, rngs=rngs)
         self.c_proj = Linear(self.n_embd, self.n_embd, rngs=rngs)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, rngs=rngs) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = (
+            Linear(self.ve_gate_channels, self.n_kv_head, rngs=rngs)
+            if has_ve(layer_idx, config.n_layer)
+            else None
+        )
 
     def __call__(self, x, ve, cos_sin, window_size):
         B, T, C = x.shape
@@ -145,7 +155,9 @@ class CausalSelfAttention(nnx.Module):
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.reshape(B, T, self.n_kv_head, self.head_dim)
-            gate = 3 * jax.nn.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head)
+            gate = 3 * jax.nn.sigmoid(
+                self.ve_gate(x[..., : self.ve_gate_channels])
+            )  # (B, T, n_kv_head)
             v = v + gate[..., None] * ve
 
         # Apply Rotary Embeddings
@@ -161,13 +173,8 @@ class CausalSelfAttention(nnx.Module):
             k = jnp.repeat(k, repeats, axis=2)
             v = jnp.repeat(v, repeats, axis=2)
 
-        # Transpose to (B, H, T, D) for jax.nn.dot_product_attention
-        # This ensures the last two dims are (Seq, Dim)
-        q = jnp.transpose(q, (0, 2, 1, 3))
-        k = jnp.transpose(k, (0, 2, 1, 3))
-        v = jnp.transpose(v, (0, 2, 1, 3))
-
-        # Build attention mask
+        # Build attention mask & calculate attention
+        # Note: q, k, v remain in (B, T, H, D) format natively for JAX
         if window_size < 0:
             # Full causal attention
             y = jax.nn.dot_product_attention(q, k, v, is_causal=True)
@@ -179,8 +186,7 @@ class CausalSelfAttention(nnx.Module):
             bias = jnp.expand_dims(bias, (0, 1))
             y = jax.nn.dot_product_attention(q, k, v, bias=bias)
 
-        # Transpose back to (B, T, H, D)
-        y = jnp.transpose(y, (0, 2, 1, 3))
+        # y is returned as (B, T, H, D) — just reshape to (B, T, C)
         y = y.reshape(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -210,20 +216,28 @@ class Block(nnx.Module):
 
 
 class GPT(nnx.Module):
-    def __init__(self, config: GPTConfig, *, rngs: nnx.Rngs, pad_vocab_size_to: int = 64):
+    def __init__(
+        self, config: GPTConfig, *, rngs: nnx.Rngs, pad_vocab_size_to: int = 64
+    ):
         self.config = config
 
         # Compute per-layer window sizes
         self.window_sizes = _compute_window_sizes(config)
 
         # Pad vocab for efficiency (tensor cores / MXU alignment)
-        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        padded_vocab_size = (
+            (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to
+        ) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
-            print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+            print0(
+                f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency"
+            )
         self.padded_vocab_size = padded_vocab_size
 
         # Transformer blocks
-        self.wte = nnx.Embed(num_embeddings=padded_vocab_size, features=config.n_embd, rngs=rngs)
+        self.wte = nnx.Embed(
+            num_embeddings=padded_vocab_size, features=config.n_embd, rngs=rngs
+        )
         self.blocks = [Block(config, i, rngs=rngs) for i in range(config.n_layer)]
         self.lm_head = Linear(config.n_embd, padded_vocab_size, rngs=rngs)
 
@@ -242,8 +256,11 @@ class GPT(nnx.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = {
-            str(i): nnx.Embed(num_embeddings=padded_vocab_size, features=kv_dim, rngs=rngs)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+            str(i): nnx.Embed(
+                num_embeddings=padded_vocab_size, features=kv_dim, rngs=rngs
+            )
+            for i in range(config.n_layer)
+            if has_ve(i, config.n_layer)
         }
 
         # Precompute rotary embeddings (large enough for 10X the sequence length)
@@ -273,26 +290,48 @@ class GPT(nnx.Module):
 
         # Embedding and unembedding
         key, k1, k2 = jax.random.split(key, 3)
-        self.wte.embedding.value = jax.random.normal(k1, self.wte.embedding.value.shape) * 0.8
-        self.lm_head.kernel.value = jax.random.normal(k2, self.lm_head.kernel.value.shape) * 0.001
+        self.wte.embedding.value = (
+            jax.random.normal(k1, self.wte.embedding.value.shape) * 0.8
+        )
+        self.lm_head.kernel.value = (
+            jax.random.normal(k2, self.lm_head.kernel.value.shape) * 0.001
+        )
 
         # Transformer blocks
         n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5  # sqrt(3) * 1/sqrt(n_embd) for Uniform matching Normal std
+        s = (
+            3**0.5 * n_embd**-0.5
+        )  # sqrt(3) * 1/sqrt(n_embd) for Uniform matching Normal std
 
         for block in self.blocks:
             key, k1, k2, k3, k4 = jax.random.split(key, 5)
-            block.attn.c_q.kernel.value = jax.random.uniform(k1, block.attn.c_q.kernel.value.shape, minval=-s, maxval=s)
-            block.attn.c_k.kernel.value = jax.random.uniform(k2, block.attn.c_k.kernel.value.shape, minval=-s, maxval=s)
-            block.attn.c_v.kernel.value = jax.random.uniform(k3, block.attn.c_v.kernel.value.shape, minval=-s, maxval=s)
-            block.attn.c_proj.kernel.value = jnp.zeros_like(block.attn.c_proj.kernel.value)
-            block.mlp.c_fc.kernel.value = jax.random.uniform(k4, block.mlp.c_fc.kernel.value.shape, minval=-s*0.4, maxval=s*0.4)
-            block.mlp.c_proj.kernel.value = jnp.zeros_like(block.mlp.c_proj.kernel.value)
+            block.attn.c_q.kernel.value = jax.random.uniform(
+                k1, block.attn.c_q.kernel.value.shape, minval=-s, maxval=s
+            )
+            block.attn.c_k.kernel.value = jax.random.uniform(
+                k2, block.attn.c_k.kernel.value.shape, minval=-s, maxval=s
+            )
+            block.attn.c_v.kernel.value = jax.random.uniform(
+                k3, block.attn.c_v.kernel.value.shape, minval=-s, maxval=s
+            )
+            block.attn.c_proj.kernel.value = jnp.zeros_like(
+                block.attn.c_proj.kernel.value
+            )
+            block.mlp.c_fc.kernel.value = jax.random.uniform(
+                k4, block.mlp.c_fc.kernel.value.shape, minval=-s * 0.4, maxval=s * 0.4
+            )
+            block.mlp.c_proj.kernel.value = jnp.zeros_like(
+                block.mlp.c_proj.kernel.value
+            )
 
         # Per-layer scalars
         n_layer = self.config.n_layer
-        resid = jnp.array([1.15 - (0.10 * i / max(n_layer - 1, 1)) for i in range(n_layer)])
-        x0 = jnp.array([0.20 - (0.15 * i / max(n_layer - 1, 1)) for i in range(n_layer)])
+        resid = jnp.array(
+            [1.15 - (0.10 * i / max(n_layer - 1, 1)) for i in range(n_layer)]
+        )
+        x0 = jnp.array(
+            [0.20 - (0.15 * i / max(n_layer - 1, 1)) for i in range(n_layer)]
+        )
         self.resid_lambdas.value = resid
         self.x0_lambdas.value = x0
 
@@ -300,18 +339,24 @@ class GPT(nnx.Module):
         key, k1 = jax.random.split(key)
         self.smear_lambda.value = jnp.zeros(1)
         self.backout_lambda.value = 0.2 * jnp.ones(1)
-        self.smear_gate.kernel.value = jax.random.uniform(k1, self.smear_gate.kernel.value.shape, minval=0.0, maxval=0.02)
+        self.smear_gate.kernel.value = jax.random.uniform(
+            k1, self.smear_gate.kernel.value.shape, minval=0.0, maxval=0.02
+        )
 
         # Value embeddings
         for ve in self.value_embeds.values():
             key, k1 = jax.random.split(key)
-            ve.embedding.value = jax.random.uniform(k1, ve.embedding.value.shape, minval=-s, maxval=s)
+            ve.embedding.value = jax.random.uniform(
+                k1, ve.embedding.value.shape, minval=-s, maxval=s
+            )
 
         # Gate weights
         for block in self.blocks:
             if block.attn.ve_gate is not None:
                 key, k1 = jax.random.split(key)
-                block.attn.ve_gate.kernel.value = jax.random.uniform(k1, block.attn.ve_gate.kernel.value.shape, minval=0.0, maxval=0.02)
+                block.attn.ve_gate.kernel.value = jax.random.uniform(
+                    k1, block.attn.ve_gate.kernel.value.shape, minval=0.0, maxval=0.02
+                )
 
         # Cast embeddings to COMPUTE_DTYPE to save memory (same as PyTorch version)
         self.wte.embedding.value = self.wte.embedding.value.astype(COMPUTE_DTYPE)
@@ -327,8 +372,14 @@ class GPT(nnx.Module):
         # Count all kernel params
         nparams = 0
         for block in self.blocks:
-            for linear in [block.attn.c_q, block.attn.c_k, block.attn.c_v, block.attn.c_proj,
-                          block.mlp.c_fc, block.mlp.c_proj]:
+            for linear in [
+                block.attn.c_q,
+                block.attn.c_k,
+                block.attn.c_v,
+                block.attn.c_proj,
+                block.mlp.c_fc,
+                block.mlp.c_proj,
+            ]:
                 nparams += linear.kernel.value.size
             if block.attn.ve_gate is not None:
                 nparams += block.attn.ve_gate.kernel.value.size
@@ -336,7 +387,11 @@ class GPT(nnx.Module):
         # Add smear gate
         nparams += self.smear_gate.kernel.value.size
 
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        h, q, t = (
+            self.config.n_head,
+            self.config.n_embd // self.config.n_head,
+            self.config.sequence_len,
+        )
         attn_flops = 0
         for window_size in self.window_sizes:
             effective_seq = t if window_size < 0 else min(window_size, t)
@@ -350,29 +405,44 @@ class GPT(nnx.Module):
         ve_count = sum(ve.embedding.value.size for ve in self.value_embeds.values())
         lm_head_count = self.lm_head.kernel.value.size
         transformer_count = sum(
-            sum(l.kernel.value.size for l in [b.attn.c_q, b.attn.c_k, b.attn.c_v, b.attn.c_proj,
-                                                b.mlp.c_fc, b.mlp.c_proj]
-                ) + (b.attn.ve_gate.kernel.value.size if b.attn.ve_gate is not None else 0)
+            sum(
+                l.kernel.value.size
+                for l in [
+                    b.attn.c_q,
+                    b.attn.c_k,
+                    b.attn.c_v,
+                    b.attn.c_proj,
+                    b.mlp.c_fc,
+                    b.mlp.c_proj,
+                ]
+            )
+            + (b.attn.ve_gate.kernel.value.size if b.attn.ve_gate is not None else 0)
             for b in self.blocks
         )
-        scalars_count = (self.resid_lambdas.value.size + self.x0_lambdas.value.size +
-                        self.smear_gate.kernel.value.size + self.smear_lambda.value.size +
-                        self.backout_lambda.value.size)
+        scalars_count = (
+            self.resid_lambdas.value.size
+            + self.x0_lambdas.value.size
+            + self.smear_gate.kernel.value.size
+            + self.smear_lambda.value.size
+            + self.backout_lambda.value.size
+        )
         total = wte_count + ve_count + lm_head_count + transformer_count + scalars_count
         return {
-            'wte': wte_count,
-            'value_embeds': ve_count,
-            'lm_head': lm_head_count,
-            'transformer_matrices': transformer_count,
-            'scalars': scalars_count,
-            'total': total,
+            "wte": wte_count,
+            "value_embeds": ve_count,
+            "lm_head": lm_head_count,
+            "transformer_matrices": transformer_count,
+            "scalars": scalars_count,
+            "total": total,
         }
 
-    def __call__(self, idx, targets=None, loss_reduction='mean'):
+    def __call__(self, idx, targets=None, loss_reduction="mean"):
         B, T = idx.shape
 
         # Grab rotary embeddings for current sequence length
-        assert T <= self.cos.shape[1], f"Sequence length {T} exceeds rotary cache {self.cos.shape[1]}"
+        assert T <= self.cos.shape[1], (
+            f"Sequence length {T} exceeds rotary cache {self.cos.shape[1]}"
+        )
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
         # Embed the tokens
@@ -382,7 +452,9 @@ class GPT(nnx.Module):
 
         # Smear: mix previous token's embedding into current position
         assert T > 1, "Forward pass should have T > 1"
-        gate = self.smear_lambda.value.astype(x.dtype) * jax.nn.sigmoid(self.smear_gate(x[:, 1:, :24]))
+        gate = self.smear_lambda.value.astype(x.dtype) * jax.nn.sigmoid(
+            self.smear_gate(x[:, 1:, :24])
+        )
         x = jnp.concatenate([x[:, :1], x[:, 1:] + gate * x[:, :-1]], axis=1)
 
         # Forward the transformer blocks
@@ -392,7 +464,11 @@ class GPT(nnx.Module):
         x_backout = None
         for i, block in enumerate(self.blocks):
             x = self.resid_lambdas.value[i] * x + self.x0_lambdas.value[i] * x0
-            ve = self.value_embeds[str(i)](idx).astype(x.dtype) if str(i) in self.value_embeds else None
+            ve = (
+                self.value_embeds[str(i)](idx).astype(x.dtype)
+                if str(i) in self.value_embeds
+                else None
+            )
             x = block(x, ve, cos_sin, self.window_sizes[i])
             if i == backout_layer:
                 x_backout = x
@@ -405,7 +481,7 @@ class GPT(nnx.Module):
         # Compute logits
         softcap = 15  # smoothly cap logits to [-softcap, softcap]
         logits = self.lm_head(x)
-        logits = logits[..., :self.config.vocab_size]  # remove padding
+        logits = logits[..., : self.config.vocab_size]  # remove padding
         logits = logits.astype(jnp.float32)  # switch to fp32 for softcap and loss
         logits = softcap * jnp.tanh(logits / softcap)
 
@@ -415,7 +491,7 @@ class GPT(nnx.Module):
             one_hot = jax.nn.one_hot(targets, self.config.vocab_size)
             log_probs = jax.nn.log_softmax(logits, axis=-1)
 
-            if loss_reduction == 'mean':
+            if loss_reduction == "mean":
                 # Mask out ignore_index (-1) targets
                 valid = targets >= 0
                 loss_per_token = -jnp.sum(one_hot * log_probs, axis=-1)
