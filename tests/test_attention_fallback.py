@@ -1,372 +1,278 @@
 """
-Test Flash Attention unified interface - verify FA3 and SDPA produce identical results.
+Test attention implementations (JAX edition).
+
+Validates that the attention primitives used in nanochat's GPT model
+produce correct outputs: causal masking, sliding window, GQA, and gradients.
 
 Run: python -m pytest tests/test_attention_fallback.py -v -s
-
-Note on test structure:
-    Tests are split into two classes due to dtype/device constraints:
-
-    1. TestFA3VsSDPA: Comparison tests that run both FA3 and SDPA on the same inputs
-       and verify they produce identical results. These require a Hopper GPU (FA3 only
-       works on sm90+) and use bfloat16 (FA3 doesn't support float32).
-
-    2. TestSDPAOnly: Tests that only exercise the SDPA fallback path. These can run
-       on any device (CUDA, CPU, MPS) with the appropriate dtype for that device.
 """
-import torch
+import jax
+import jax.numpy as jnp
 import pytest
-import nanochat.flash_attention as fa_module
-from nanochat.flash_attention import flash_attn, HAS_FA3
-from nanochat.engine import KVCache
+
+from nanochat.gpt import (
+    _make_sliding_window_mask,
+    apply_rotary_emb,
+    precompute_rotary_embeddings,
+    rms_norm,
+)
 
 
-def set_impl(impl):
-    """Set the implementation override ('fa3', 'sdpa', or None for auto) and re-resolve USE_FA3."""
-    fa_module._override_impl = impl
-    fa_module.USE_FA3 = fa_module._resolve_use_fa3()
-
-
-def run_both_impls(fn):
-    """Run a function with both FA3 and SDPA, return both outputs."""
-    set_impl('fa3')
-    out_fa3 = fn()
-    set_impl('sdpa')
-    out_sdpa = fn()
-    set_impl(None)  # reset
-    return out_fa3, out_sdpa
-
-
-def assert_close(t1, t2, name, atol=1e-2, rtol=1e-2):
-    """Assert two tensors are close, with helpful error message."""
-    max_diff = (t1 - t2).abs().max().item()
-    mean_diff = (t1 - t2).abs().mean().item()
-    assert torch.allclose(t1, t2, atol=atol, rtol=rtol), \
+def assert_close(a, b, name, atol=1e-2, rtol=1e-2):
+    """Assert two JAX arrays are close, with a helpful error message."""
+    diff = jnp.abs(a - b)
+    max_diff = float(jnp.max(diff))
+    mean_diff = float(jnp.mean(diff))
+    assert jnp.allclose(a, b, atol=atol, rtol=rtol), \
         f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
     return max_diff, mean_diff
 
 
 # =============================================================================
-# FA3 vs SDPA comparison tests (require Hopper GPU)
+# Sliding Window Mask tests
 # =============================================================================
-@pytest.mark.skipif(not HAS_FA3, reason="FA3 required to compare implementations")
-class TestFA3VsSDPA:
-    """Compare FA3 and SDPA produce identical results. Requires Hopper GPU."""
+class TestSlidingWindowMask:
+    """Test the sliding window mask construction."""
 
-    DEVICE = "cuda"
-    DTYPE = torch.bfloat16
+    def test_causal_mask_basic(self):
+        """Full-context causal mask: lower-triangular True."""
+        T = 8
+        mask = _make_sliding_window_mask(T, window_size=-1)
+        # Should be lower-triangular
+        expected = jnp.tril(jnp.ones((T, T), dtype=bool))
+        assert jnp.array_equal(mask, expected), "Causal mask should be lower triangular"
 
-    def test_basic_causal(self):
-        """Basic causal attention."""
-        B, T, H, D = 2, 64, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+    def test_sliding_window_restricts_attention(self):
+        """Sliding window should restrict how far back a token can attend."""
+        T = 16
+        window = 4
+        mask = _make_sliding_window_mask(T, window_size=window)
 
-        def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+        # Token at position 10 should attend to positions 6..10 (window=4)
+        for row in range(T):
+            for col in range(T):
+                if col <= row and (row - col) <= window:
+                    assert mask[row, col], f"mask[{row},{col}] should be True"
+                else:
+                    assert not mask[row, col], f"mask[{row},{col}] should be False"
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "basic_causal")
-        print(f"basic_causal: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+    def test_window_size_1_is_diagonal(self):
+        """Window size 0 means only attend to self (current position)."""
+        T = 8
+        mask = _make_sliding_window_mask(T, window_size=0)
+        expected = jnp.eye(T, dtype=bool)
+        assert jnp.array_equal(mask, expected), "Window=0 should be identity (self-attention only)"
 
-    def test_full_context(self):
-        """Full context (window_size=-1)."""
-        B, T, H, D = 2, 128, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+    def test_large_window_equals_causal(self):
+        """Window >= T should be equivalent to full causal mask."""
+        T = 16
+        mask_windowed = _make_sliding_window_mask(T, window_size=T)
+        mask_causal = _make_sliding_window_mask(T, window_size=-1)
+        assert jnp.array_equal(mask_windowed, mask_causal), \
+            "Window >= T should produce the same mask as full causal"
 
-        def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "full_context")
-        print(f"full_context: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+# =============================================================================
+# dot_product_attention tests
+# =============================================================================
+class TestDotProductAttention:
+    """Test jax.nn.dot_product_attention used in CausalSelfAttention."""
 
-    def test_sliding_window(self):
-        """Sliding window attention."""
-        B, T, H, D = 2, 128, 4, 32
-        window = 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+    DTYPE = jnp.bfloat16
 
-        def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0))
+    def test_causal_basic(self):
+        """Basic causal attention produces valid output shape."""
+        B, H, T, D = 2, 4, 64, 32
+        key = jax.random.key(0)
+        q = jax.random.normal(jax.random.fold_in(key, 0), (B, H, T, D), dtype=self.DTYPE)
+        k = jax.random.normal(jax.random.fold_in(key, 1), (B, H, T, D), dtype=self.DTYPE)
+        v = jax.random.normal(jax.random.fold_in(key, 2), (B, H, T, D), dtype=self.DTYPE)
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "sliding_window")
-        print(f"sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        y = jax.nn.dot_product_attention(q, k, v, is_causal=True)
 
-    def test_gqa(self):
-        """Group Query Attention (fewer KV heads than Q heads)."""
-        B, T, D = 2, 64, 32
+        assert y.shape == (B, H, T, D), f"Expected shape {(B, H, T, D)}, got {y.shape}"
+        assert not jnp.any(jnp.isnan(y)), "Output contains NaN"
+
+    def test_sliding_window_with_bias(self):
+        """Sliding window via bias mask produces valid output."""
+        B, H, T, D = 2, 4, 64, 32
+        window = 16
+        key = jax.random.key(1)
+        q = jax.random.normal(jax.random.fold_in(key, 0), (B, H, T, D), dtype=self.DTYPE)
+        k = jax.random.normal(jax.random.fold_in(key, 1), (B, H, T, D), dtype=self.DTYPE)
+        v = jax.random.normal(jax.random.fold_in(key, 2), (B, H, T, D), dtype=self.DTYPE)
+
+        mask = _make_sliding_window_mask(T, window)
+        bias = jnp.where(mask[None, None, :, :], 0.0, jnp.finfo(self.DTYPE).min)
+        y = jax.nn.dot_product_attention(q, k, v, bias=bias)
+
+        assert y.shape == (B, H, T, D)
+        assert not jnp.any(jnp.isnan(y)), "Output contains NaN"
+
+    def test_sliding_window_differs_from_full_context(self):
+        """Sliding window attention should produce different results than full context."""
+        B, H, T, D = 1, 2, 32, 16
+        window = 8
+        key = jax.random.key(2)
+        q = jax.random.normal(jax.random.fold_in(key, 0), (B, H, T, D), dtype=jnp.float32)
+        k = jax.random.normal(jax.random.fold_in(key, 1), (B, H, T, D), dtype=jnp.float32)
+        v = jax.random.normal(jax.random.fold_in(key, 2), (B, H, T, D), dtype=jnp.float32)
+
+        # Full causal
+        y_full = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+
+        # Sliding window
+        mask = _make_sliding_window_mask(T, window)
+        bias = jnp.where(mask[None, None, :, :], 0.0, jnp.finfo(jnp.float32).min)
+        y_window = jax.nn.dot_product_attention(q, k, v, bias=bias)
+
+        # They should differ (except for early tokens within window)
+        # At position >= window, the outputs should diverge
+        late_full = y_full[:, :, window+1:, :]
+        late_window = y_window[:, :, window+1:, :]
+        assert not jnp.allclose(late_full, late_window, atol=1e-3), \
+            "Sliding window should differ from full causal for positions beyond the window"
+
+    def test_gqa_head_expansion(self):
+        """GQA: fewer KV heads than Q heads via jnp.repeat."""
+        B, T, D = 2, 32, 16
         n_heads = 8
         n_kv_heads = 2
+        key = jax.random.key(3)
 
-        q = torch.randn(B, T, n_heads, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = jax.random.normal(jax.random.fold_in(key, 0), (B, n_heads, T, D), dtype=self.DTYPE)
+        k = jax.random.normal(jax.random.fold_in(key, 1), (B, n_kv_heads, T, D), dtype=self.DTYPE)
+        v = jax.random.normal(jax.random.fold_in(key, 2), (B, n_kv_heads, T, D), dtype=self.DTYPE)
 
-        def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+        # Repeat KV heads to match Q heads (how GPT model does it)
+        repeats = n_heads // n_kv_heads
+        k_expanded = jnp.repeat(k, repeats, axis=1)
+        v_expanded = jnp.repeat(v, repeats, axis=1)
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "gqa")
-        print(f"gqa: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        assert k_expanded.shape == (B, n_heads, T, D)
+        y = jax.nn.dot_product_attention(q, k_expanded, v_expanded, is_causal=True)
 
-    def test_larger_model(self):
-        """Larger dimensions closer to real model."""
-        B, T, H, D = 4, 256, 12, 64
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        assert y.shape == (B, n_heads, T, D)
+        assert not jnp.any(jnp.isnan(y)), "GQA output contains NaN"
 
-        def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
+    def test_gradients_flow(self):
+        """Verify gradients flow through attention."""
+        B, H, T, D = 2, 4, 32, 16
+        key = jax.random.key(4)
+        q = jax.random.normal(jax.random.fold_in(key, 0), (B, H, T, D), dtype=jnp.float32)
+        k = jax.random.normal(jax.random.fold_in(key, 1), (B, H, T, D), dtype=jnp.float32)
+        v = jax.random.normal(jax.random.fold_in(key, 2), (B, H, T, D), dtype=jnp.float32)
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "larger_model")
-        print(f"larger_model: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        def attn_loss(q, k, v):
+            y = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+            return jnp.sum(y)
 
-    def test_kvcache_prefill(self):
-        """Test prefill (inserting multiple tokens into empty cache)."""
-        B, T_max, H, D = 2, 64, 4, 32
-        T_prefill = 16
+        grads = jax.grad(attn_loss, argnums=(0, 1, 2))(q, k, v)
+        q_grad, k_grad, v_grad = grads
 
-        q = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        assert q_grad.shape == q.shape, "q gradient shape mismatch"
+        assert k_grad.shape == k.shape, "k gradient shape mismatch"
+        assert v_grad.shape == v.shape, "v gradient shape mismatch"
+        assert not jnp.any(jnp.isnan(q_grad)), "NaN in q gradient"
+        assert not jnp.any(jnp.isnan(k_grad)), "NaN in k gradient"
+        assert not jnp.any(jnp.isnan(v_grad)), "NaN in v gradient"
 
-        def run():
-            k_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
-            v_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
-            cache_seqlens = torch.zeros(B, dtype=torch.int32, device=self.DEVICE)
-            return flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache, k=k, v=v,
-                cache_seqlens=cache_seqlens,
-                causal=True, window_size=(T_max, 0)
-            )
+    def test_causal_masking_correctness(self):
+        """Verify causal masking: future tokens should not influence past outputs."""
+        B, H, T, D = 1, 1, 8, 4
+        key = jax.random.key(5)
+        q = jax.random.normal(jax.random.fold_in(key, 0), (B, H, T, D), dtype=jnp.float32)
+        k = jax.random.normal(jax.random.fold_in(key, 1), (B, H, T, D), dtype=jnp.float32)
+        v = jax.random.normal(jax.random.fold_in(key, 2), (B, H, T, D), dtype=jnp.float32)
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "prefill")
-        print(f"prefill: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        y_full = jax.nn.dot_product_attention(q, k, v, is_causal=True)
 
-    def test_kvcache_single_token(self):
-        """Test single token generation (cache already has content)."""
-        B, T_max, H, D = 2, 64, 4, 32
-        T_prefill = 16
+        # Now zero out future K/V (positions > 4) — output at positions 0..4 should be unchanged
+        k_truncated = k.at[:, :, 5:, :].set(0.0)
+        v_truncated = v.at[:, :, 5:, :].set(0.0)
+        y_truncated = jax.nn.dot_product_attention(q, k_truncated, v_truncated, is_causal=True)
 
-        k_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-
-        def run():
-            k_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
-            v_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
-            k_cache[:, :T_prefill, :, :] = k_init
-            v_cache[:, :T_prefill, :, :] = v_init
-            cache_seqlens = torch.full((B,), T_prefill, dtype=torch.int32, device=self.DEVICE)
-            return flash_attn.flash_attn_with_kvcache(
-                q_single, k_cache, v_cache, k=k_single, v=v_single,
-                cache_seqlens=cache_seqlens,
-                causal=True, window_size=(T_max, 0)
-            )
-
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "single_token")
-        print(f"single_token: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-
-    def test_kvcache_single_token_sliding_window(self):
-        """Test single token decode with sliding window smaller than cache size.
-
-        This catches the bug where SDPA ignores window_size during Tq=1 decode.
-        When window < Tk, FA3 only attends to the last (window+1) tokens,
-        but SDPA was attending to all cached tokens.
-        """
-        B, T_max, H, D = 2, 64, 4, 32
-        T_prefill = 32  # Enough tokens to exceed window
-        window = 8      # Window SMALLER than cache size
-
-        k_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-
-        def run():
-            k_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
-            v_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
-            k_cache[:, :T_prefill, :, :] = k_init
-            v_cache[:, :T_prefill, :, :] = v_init
-            cache_seqlens = torch.full((B,), T_prefill, dtype=torch.int32, device=self.DEVICE)
-            return flash_attn.flash_attn_with_kvcache(
-                q_single, k_cache, v_cache, k=k_single, v=v_single,
-                cache_seqlens=cache_seqlens,
-                causal=True, window_size=(window, 0)  # window=8 < Tk=33
-            )
-
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "single_token_sliding_window")
-        print(f"single_token_sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-
-    def test_backward_gradients_match(self):
-        """Verify gradients are similar between FA3 and SDPA."""
-        B, T, H, D = 2, 32, 4, 16
-
-        q_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-
-        def run():
-            q = q_data.clone().requires_grad_(True)
-            k = k_data.clone().requires_grad_(True)
-            v = v_data.clone().requires_grad_(True)
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
-            loss = y.sum()
-            loss.backward()
-            return y.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
-
-        set_impl('fa3')
-        y_fa3, q_grad_fa3, k_grad_fa3, v_grad_fa3 = run()
-        set_impl('sdpa')
-        y_sdpa, q_grad_sdpa, k_grad_sdpa, v_grad_sdpa = run()
-        set_impl(None)
-
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "backward_output")
-        print(f"backward_output: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-
-        max_diff, mean_diff = assert_close(q_grad_fa3, q_grad_sdpa, "q_grad", atol=0.05, rtol=0.05)
-        print(f"q_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-
-        max_diff, mean_diff = assert_close(k_grad_fa3, k_grad_sdpa, "k_grad", atol=0.05, rtol=0.05)
-        print(f"k_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-
-        max_diff, mean_diff = assert_close(v_grad_fa3, v_grad_sdpa, "v_grad", atol=0.05, rtol=0.05)
-        print(f"v_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-
-
-# =============================================================================
-# SDPA-only tests (run on any device)
-# =============================================================================
-class TestSDPAOnly:
-    """Test SDPA fallback works correctly. Runs on any device."""
-
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-
-    def test_basic_forward(self):
-        """Test SDPA forward pass produces valid output."""
-        set_impl('sdpa')
-        B, T, H, D = 2, 64, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
-
-        assert y.shape == (B, T, H, D)
-        assert not torch.isnan(y).any(), "Output contains NaN"
-        set_impl(None)
-
-    def test_backward(self):
-        """Test gradients flow through SDPA."""
-        set_impl('sdpa')
-        B, T, H, D = 2, 32, 4, 16
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
-
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
-        loss = y.sum()
-        loss.backward()
-
-        assert q.grad is not None, "No gradient for q"
-        assert k.grad is not None, "No gradient for k"
-        assert v.grad is not None, "No gradient for v"
-        assert not torch.isnan(q.grad).any(), "NaN in q gradient"
-        set_impl(None)
-
-    def test_kvcache(self):
-        """Test SDPA with KV cache."""
-        set_impl('sdpa')
-        B, T_max, H, D = 2, 64, 4, 32
-        n_layers = 1
-
-        cache = KVCache(
-            batch_size=B, num_heads=H, seq_len=T_max, head_dim=D,
-            num_layers=n_layers, device=self.DEVICE, dtype=self.DTYPE
+        # Positions 0..4 should be identical (causal = can't see positions 5+)
+        assert_close(
+            y_full[:, :, :5, :], y_truncated[:, :, :5, :],
+            "causal_mask_correctness", atol=1e-5, rtol=1e-5
         )
-        k_cache, v_cache = cache.get_layer_cache(0)
-
-        # Prefill
-        T_prefill = 16
-        q = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-
-        y = flash_attn.flash_attn_with_kvcache(
-            q, k_cache, v_cache, k=k, v=v,
-            cache_seqlens=cache.cache_seqlens,
-            causal=True, window_size=(T_max, 0)
-        )
-        cache.advance(T_prefill)
-
-        assert y.shape == (B, T_prefill, H, D)
-        assert cache.get_pos() == T_prefill
-
-        # Generate single token
-        q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-
-        y_single = flash_attn.flash_attn_with_kvcache(
-            q_single, k_cache, v_cache, k=k_single, v=v_single,
-            cache_seqlens=cache.cache_seqlens,
-            causal=True, window_size=(T_max, 0)
-        )
-        cache.advance(1)
-
-        assert y_single.shape == (B, 1, H, D)
-        assert cache.get_pos() == T_prefill + 1
-        set_impl(None)
 
 
 # =============================================================================
-# Override mechanism tests
+# Rotary Embedding tests
 # =============================================================================
-class TestOverrideMechanism:
-    """Test that the override mechanism works correctly."""
+class TestRotaryEmbeddings:
+    """Test rotary position embedding implementation."""
 
-    @pytest.mark.skipif(not HAS_FA3, reason="FA3 required")
-    def test_override_fa3(self):
-        """Test that override='fa3' uses FA3."""
-        set_impl('fa3')
-        assert fa_module.USE_FA3 == True
-        set_impl(None)
+    def test_shapes(self):
+        """Rotary embeddings have correct output shapes."""
+        seq_len = 128
+        head_dim = 64
+        cos, sin = precompute_rotary_embeddings(seq_len, head_dim)
+        assert cos.shape == (1, seq_len, 1, head_dim // 2)
+        assert sin.shape == (1, seq_len, 1, head_dim // 2)
 
-    def test_override_sdpa(self):
-        """Test that override='sdpa' uses SDPA."""
-        set_impl('sdpa')
-        assert fa_module.USE_FA3 == False
-        set_impl(None)
+    def test_apply_preserves_shape(self):
+        """apply_rotary_emb preserves input shape."""
+        B, T, H, D = 2, 32, 4, 64
+        cos, sin = precompute_rotary_embeddings(T, D)
+        x = jax.random.normal(jax.random.key(0), (B, T, H, D))
+        y = apply_rotary_emb(x, cos, sin)
+        assert y.shape == x.shape
 
-    def test_override_auto(self):
-        """Test that override=None uses auto-detection."""
-        set_impl(None)
-        assert fa_module.USE_FA3 == HAS_FA3
+    def test_different_positions_get_different_embeddings(self):
+        """Different sequence positions should produce different rotary outputs."""
+        B, T, H, D = 1, 16, 1, 32
+        cos, sin = precompute_rotary_embeddings(T, D)
+        x = jnp.ones((B, T, H, D))  # Same input at every position
+        y = apply_rotary_emb(x, cos, sin)
+        # Output at position 0 should differ from position 8
+        assert not jnp.allclose(y[0, 0], y[0, 8], atol=1e-3), \
+            "Rotary embeddings should produce different outputs at different positions"
+
+    def test_orthogonality(self):
+        """Rotary embedding should approximately preserve vector norms."""
+        B, T, H, D = 1, 32, 1, 64
+        cos, sin = precompute_rotary_embeddings(T, D)
+        x = jax.random.normal(jax.random.key(0), (B, T, H, D))
+        y = apply_rotary_emb(x, cos, sin)
+        # Norms should be approximately preserved (rotary is a rotation)
+        x_norms = jnp.linalg.norm(x, axis=-1)
+        y_norms = jnp.linalg.norm(y, axis=-1)
+        assert_close(x_norms, y_norms, "rotary_norm_preservation", atol=1e-5, rtol=1e-5)
 
 
+# =============================================================================
+# RMSNorm tests
+# =============================================================================
+class TestRMSNorm:
+    """Test RMSNorm implementation."""
+
+    def test_output_scale(self):
+        """RMSNorm should normalize the RMS to approximately 1."""
+        x = jax.random.normal(jax.random.key(0), (2, 32, 256))
+        y = rms_norm(x)
+        # After RMSNorm, RMS of each vector should be ~1
+        rms = jnp.sqrt(jnp.mean(jnp.square(y), axis=-1))
+        assert_close(rms, jnp.ones_like(rms), "rms_norm_output", atol=1e-3, rtol=1e-3)
+
+    def test_gradient_flows(self):
+        """Gradients should flow through RMSNorm."""
+        x = jax.random.normal(jax.random.key(0), (2, 32, 64))
+        grad_fn = jax.grad(lambda x: jnp.sum(rms_norm(x)))
+        g = grad_fn(x)
+        assert g.shape == x.shape
+        assert not jnp.any(jnp.isnan(g)), "NaN in RMSNorm gradient"
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
 if __name__ == "__main__":
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name()}")
-        major, minor = torch.cuda.get_device_capability()
-        print(f"Compute capability: {major}.{minor}")
-    print(f"HAS_FA3: {HAS_FA3}")
+    print(f"JAX version: {jax.__version__}")
+    print(f"JAX backend: {jax.default_backend()}")
+    print(f"Devices: {jax.devices()}")
     print()
 
     pytest.main([__file__, "-v", "-s"])

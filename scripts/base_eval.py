@@ -1,5 +1,5 @@
 """
-Unified evaluation script for base models.
+Unified evaluation script for base models (JAX/TPU edition).
 
 Supports three evaluation modes (comma-separated):
   --eval core    : CORE metric (accuracy on ICL tasks)
@@ -9,14 +9,10 @@ Supports three evaluation modes (comma-separated):
 Default is all three: --eval core,bpb,sample
 
 Examples:
+    # Evaluate a nanochat model
+    python -m scripts.base_eval --model-tag d24 --device-batch-size=16
 
-    # Evaluate a HuggingFace model (e.g. GPT-2 124M) using 8 GPUs
-    torchrun --nproc_per_node=8 -m scripts.base_eval --hf-path openai-community/gpt2
-
-    # Evaluate a nanochat model (e.g. d24) using 8 GPUs
-    torchrun --nproc_per_node=8 -m scripts.base_eval --model-tag d24 --device-batch-size=16
-
-    # Quick/approximate evaluation using a single GPU
+    # Quick/approximate evaluation
     python -m scripts.base_eval --model-tag d24 --device-batch-size=16 --max-per-task=100 --split-tokens=524288
 """
 import os
@@ -29,62 +25,16 @@ import random
 import zipfile
 import tempfile
 import argparse
-import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
-from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
+import jax
+import jax.numpy as jnp
+
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, download_file_with_lock
+from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-
-# -----------------------------------------------------------------------------
-# HuggingFace loading utilities
-
-class ModelWrapper:
-    """Lightweight wrapper to give HuggingFace models a nanochat-compatible interface."""
-    def __init__(self, model, max_seq_len=None):
-        self.model = model
-        self.max_seq_len = max_seq_len
-
-    def __call__(self, input_ids, targets=None, loss_reduction='mean'):
-        logits = self.model(input_ids).logits
-        if targets is None:
-            return logits
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
-            ignore_index=-1,
-            reduction=loss_reduction
-        )
-        return loss
-
-    def get_device(self):
-        return next(self.model.parameters()).device
-
-
-def load_hf_model(hf_path: str, device):
-    """Load a HuggingFace model and tokenizer."""
-    print0(f"Loading HuggingFace model from: {hf_path}")
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(hf_path)
-    model.to(device)
-    model.eval()
-    max_seq_len = 1024 if "gpt2" in hf_path else None
-    model = ModelWrapper(model, max_seq_len=max_seq_len)
-    tokenizer = HuggingFaceTokenizer.from_pretrained(hf_path)
-    return model, tokenizer
-
-
-def get_hf_token_bytes(tokenizer, device="cpu"):
-    """Compute token_bytes tensor for a HuggingFace tokenizer."""
-    vocab_size = tokenizer.tokenizer.get_vocab_size()
-    token_bytes = torch.zeros(vocab_size, dtype=torch.int64, device=device)
-    for token_id in range(vocab_size):
-        token_str = tokenizer.tokenizer.decode([token_id])
-        token_bytes[token_id] = len(token_str.encode('utf-8'))
-    return token_bytes
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -104,7 +54,7 @@ def place_eval_bundle(file_path):
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1):
+def evaluate_core(model, tokenizer, max_per_task=-1):
     """
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
@@ -156,7 +106,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         if max_per_task > 0:
             data = data[:max_per_task]
 
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(model, tokenizer, data, task_meta)
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
@@ -176,15 +126,13 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 # Main
 
 def main():
-    parser = argparse.ArgumentParser(description="Base model evaluation")
-    parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
-    parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path (e.g. openai-community/gpt2-xl)')
-    parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
+    parser = argparse.ArgumentParser(description="Base model evaluation (JAX/TPU)")
+    parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations: core,bpb,sample')
+    parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
-    parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
-    parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--split-tokens', type=int, default=40*524288, help='Tokens per split for BPB')
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -194,39 +142,32 @@ def main():
     if invalid:
         parser.error(f"Invalid eval modes: {invalid}. Valid: {valid_modes}")
 
-    # Distributed / precision setup
-    device_type = autodetect_device_type() if args.device_type == '' else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    # Init
+    num_devices, proc_idx, proc_count = compute_init()
+    master_process = proc_idx == 0
+
     # Load model and tokenizer
-    is_hf_model = args.hf_path is not None
-    if is_hf_model:
-        model, tokenizer = load_hf_model(args.hf_path, device)
-        sequence_len = model.max_seq_len or 1024
-        token_bytes = get_hf_token_bytes(tokenizer, device=device)
-        model_name = args.hf_path
-        model_slug = args.hf_path.replace("/", "-")
-    else:
-        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
-        sequence_len = meta["model_config"]["sequence_len"]
-        token_bytes = get_token_bytes(device=device)
-        model_name = f"base_model (step {meta['step']})"
-        model_slug = f"base_model_{meta['step']:06d}"
+    model, tokenizer, meta = load_model("base", phase="eval", model_tag=args.model_tag, step=args.step)
+    sequence_len = meta["model_config"]["sequence_len"]
+    token_bytes = get_token_bytes()
+    model_name = f"base_model (step {meta['step']})"
+    model_slug = f"base_model_{meta['step']:06d}"
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
 
-    # Results to log
+    # Results
     core_results = None
     bpb_results = {}
     samples = []
     unconditioned_samples = []
 
     # --- Sampling ---
-    if 'sample' in eval_modes and not is_hf_model:
+    if 'sample' in eval_modes:
         print0("\n" + "="*80)
         print0("Model Samples")
         print0("="*80)
-        if ddp_rank == 0:
+        if master_process:
             prompts = [
                 "The capital of France is",
                 "The chemical symbol of gold is",
@@ -254,23 +195,25 @@ def main():
                 print0("-" * 80)
                 print0(sample_str)
                 unconditioned_samples.append(sample_str)
-    elif 'sample' in eval_modes and is_hf_model:
-        print0("\nSkipping sampling for HuggingFace models (not supported)")
 
     # --- BPB evaluation ---
     if 'bpb' in eval_modes:
         print0("\n" + "="*80)
         print0("BPB Evaluation")
         print0("="*80)
-        tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
+        from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
+        tokens_per_step = args.device_batch_size * sequence_len * num_devices
         if args.split_tokens % tokens_per_step != 0:
-            # Adjust to nearest multiple
             args.split_tokens = (args.split_tokens // tokens_per_step) * tokens_per_step
-            print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
+            print0(f"Adjusted split_tokens to {args.split_tokens}")
         steps = args.split_tokens // tokens_per_step
 
+        base_dir = get_base_dir()
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            data_dir = os.path.join(base_dir, "data", split_name)
+            loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+                data_dir, tokenizer, args.device_batch_size, sequence_len,
+            )
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")
@@ -280,10 +223,9 @@ def main():
         print0("\n" + "="*80)
         print0("CORE Evaluation")
         print0("="*80)
-        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task)
+        core_results = evaluate_core(model, tokenizer, max_per_task=args.max_per_task)
 
-        # Write CSV output
-        if ddp_rank == 0:
+        if master_process:
             base_dir = get_base_dir()
             output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
@@ -300,20 +242,16 @@ def main():
     # --- Log to report ---
     from nanochat.report import get_report
     report_data = [{"model": model_name}]
-
     if core_results:
         report_data[0]["CORE metric"] = core_results["core_metric"]
         report_data.append(core_results["centered_results"])
-
     if bpb_results:
         report_data[0]["train bpb"] = bpb_results.get("train")
         report_data[0]["val bpb"] = bpb_results.get("val")
-
     if samples:
         report_data.append({f"sample {i}": s for i, s in enumerate(samples)})
     if unconditioned_samples:
         report_data.append({f"unconditioned {i}": s for i, s in enumerate(unconditioned_samples)})
-
     get_report().log(section="Base model evaluation", data=report_data)
 
     compute_cleanup()

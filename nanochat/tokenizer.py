@@ -394,13 +394,18 @@ def get_tokenizer():
     # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
-def get_token_bytes(device="cpu"):
-    import torch
+def get_token_bytes():
+    import numpy as np
+    import jax.numpy as jnp
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
-    with open(token_bytes_path, "rb") as f:
-        token_bytes = torch.load(f, map_location=device)
-    return token_bytes
+    npy_path = os.path.join(tokenizer_dir, "token_bytes.npy")
+    if os.path.exists(npy_path):
+        token_bytes = np.load(npy_path)
+    else:
+        raise FileNotFoundError(
+            f"Token bytes not found at {npy_path}. Run tok_train.py first. "
+            f"(If you have old .pt format, re-run tok_train.py to generate .npy.)"
+        )
+    return jnp.array(token_bytes)

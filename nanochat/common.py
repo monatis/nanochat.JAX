@@ -1,34 +1,22 @@
 """
-Common utilities for nanochat.
+Common utilities for nanochat (JAX/TPU edition).
 """
 
 import os
 import re
 import logging
 import urllib.request
-import torch
-import torch.distributed as dist
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental import mesh_utils
 from filelock import FileLock
 
-# The dtype used for compute (matmuls, activations). Master weights stay fp32 for optimizer precision.
-# Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
-# Override with NANOCHAT_DTYPE env var: "bfloat16", "float16", "float32"
-_DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-def _detect_compute_dtype():
-    env = os.environ.get("NANOCHAT_DTYPE")
-    if env is not None:
-        return _DTYPE_MAP[env], f"set via NANOCHAT_DTYPE={env}"
-    if torch.cuda.is_available():
-        # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
-        # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
-        capability = torch.cuda.get_device_capability()
-        if capability >= (8, 0):
-            return torch.bfloat16, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (bf16 supported)"
-        # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
-        # Users can still force fp16 via NANOCHAT_DTYPE=float16 if they know what they're doing.
-        return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
-    return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
-COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
+# The dtype used for compute (matmuls, activations).
+# On TPU, bfloat16 is the native high-throughput dtype for the MXU.
+# On CPU/GPU fallback, we use float32.
+COMPUTE_DTYPE = jnp.bfloat16 if jax.default_backend() == 'tpu' else jnp.float32
+COMPUTE_DTYPE_REASON = f"auto-detected: {jax.default_backend()} backend"
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
@@ -115,8 +103,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     return file_path
 
 def print0(s="",**kwargs):
-    ddp_rank = int(os.environ.get('RANK', 0))
-    if ddp_rank == 0:
+    if jax.process_index() == 0:
         print(s, **kwargs)
 
 def print_banner():
@@ -133,84 +120,43 @@ def print_banner():
     """
     print0(banner)
 
-def is_ddp_requested() -> bool:
-    """
-    True if launched by torchrun (env present), even before init.
-    Used to decide whether we *should* initialize a PG.
-    """
-    return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
-
-def is_ddp_initialized() -> bool:
-    """
-    True if torch.distributed is available and the process group is initialized.
-    Used at cleanup to avoid destroying a non-existent PG.
-    """
-    return dist.is_available() and dist.is_initialized()
+# --- Distributed / Mesh utilities ---
 
 def get_dist_info():
-    if is_ddp_requested():
-        # We rely on torchrun's env to decide if we SHOULD init.
-        # (Initialization itself happens in compute init.)
-        assert all(var in os.environ for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE'])
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        return True, ddp_rank, ddp_local_rank, ddp_world_size
-    else:
-        return False, 0, 0, 1
+    """
+    Returns (num_devices, process_index, process_count).
+    In JAX SPMD, there is no "DDP" flag — all devices are always visible.
+    """
+    return jax.device_count(), jax.process_index(), jax.process_count()
 
-def autodetect_device_type():
-    # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
-    if torch.cuda.is_available():
-        device_type = "cuda"
-    elif torch.backends.mps.is_available():
-        device_type = "mps"
-    else:
-        device_type = "cpu"
-    print0(f"Autodetected device type: {device_type}")
-    return device_type
+def create_mesh(mesh_shape=None, axis_names=('data',)):
+    """
+    Create a device mesh for SPMD parallelism.
+    By default, creates a 1D mesh with all devices on the 'data' axis (pure data parallelism).
+    """
+    if mesh_shape is None:
+        mesh_shape = (jax.device_count(),)
+    devices = mesh_utils.create_device_mesh(mesh_shape)
+    return Mesh(devices, axis_names=axis_names)
 
-def compute_init(device_type="cuda"): # cuda|cpu|mps
-    """Basic initialization that we keep doing over and over, so make common."""
+def compute_init():
+    """Basic initialization for JAX distributed training."""
+    # Initialize multi-host JAX if needed (multi-host TPU pods)
+    if not jax.distributed.is_initialized():
+        jax.distributed.initialize()
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
-    if device_type == "cuda":
-        assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
-    if device_type == "mps":
-        assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
+    num_devices, proc_idx, proc_count = get_dist_info()
 
-    # Reproducibility
-    # Note that we set the global seeds here, but most of the code uses explicit rng objects.
-    # The only place where global rng might be used is nn.Module initialization of the model weights.
-    torch.manual_seed(42)
-    if device_type == "cuda":
-        torch.cuda.manual_seed(42)
-    # skipping full reproducibility for now, possibly investigate slowdown later
-    # torch.use_deterministic_algorithms(True)
+    if proc_idx == 0:
+        logger.info(f"JAX backend: {jax.default_backend()}")
+        logger.info(f"Devices: {num_devices} (across {proc_count} hosts)")
+        logger.info(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-    # Precision
-    if device_type == "cuda":
-        torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls, see https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
-
-    # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
-    is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if is_ddp_requested and device_type == "cuda":
-        device = torch.device("cuda", ddp_local_rank)
-        torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
-        dist.barrier()
-    else:
-        device = torch.device(device_type) # mps|cpu
-
-    if ddp_rank == 0:
-        logger.info(f"Distributed world size: {ddp_world_size}")
-
-    return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
+    return num_devices, proc_idx, proc_count
 
 def compute_cleanup():
-    """Companion function to compute_init, to clean things up before script exit"""
-    if is_ddp_initialized():
-        dist.destroy_process_group()
+    """Companion function to compute_init — no-op for JAX (no process groups to destroy)."""
+    pass
 
 class DummyWandb:
     """Useful if we wish to not use wandb but have all the same signatures"""
@@ -221,58 +167,42 @@ class DummyWandb:
     def finish(self):
         pass
 
-# hardcoded BF16 peak flops for various GPUs
+# hardcoded BF16 peak flops for various accelerators
 # inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py
 # and PR: https://github.com/karpathy/nanochat/pull/147
 def get_peak_flops(device_name: str) -> float:
     name = device_name.lower()
 
-    # Table order matters: more specific patterns first.
     _PEAK_FLOPS_TABLE = (
-        # NVIDIA Blackwell
-        (["gb200"], 2.5e15),
-        (["grace blackwell"], 2.5e15),
-        (["b200"], 2.25e15),
-        (["b100"], 1.8e15),
-        # NVIDIA Hopper
-        (["h200", "nvl"], 836e12),
-        (["h200", "pcie"], 836e12),
+        # Google TPU
+        (["tpu v6e"], 918e12),      # TPU v6e: 918 bf16 TFLOPS
+        (["tpu v5p"], 918e12),      # TPU v5p: 918 bf16 TFLOPS
+        (["tpu v5e"], 197e12),      # TPU v5e (v5 litepod): 197 bf16 TFLOPS
+        (["tpu v4"], 275e12),       # TPU v4: 275 bf16 TFLOPS
+        (["tpu v3"], 123e12),       # TPU v3: 123 bf16 TFLOPS
+        # NVIDIA (kept for GPU fallback)
         (["h200"], 989e12),
-        (["h100", "nvl"], 835e12),
-        (["h100", "pcie"], 756e12),
         (["h100"], 989e12),
-        (["h800", "nvl"], 989e12),
-        (["h800"], 756e12),
-        # NVIDIA Ampere data center
         (["a100"], 312e12),
-        (["a800"], 312e12),
-        (["a40"], 149.7e12),
-        (["a30"], 165e12),
-        # NVIDIA Ada data center
-        (["l40s"], 362e12),
-        (["l40-s"], 362e12),
-        (["l40 s"], 362e12),
-        (["l4"], 121e12),
-        # AMD CDNA accelerators
-        (["mi355"], 2.5e15),
-        (["mi325"], 1.3074e15),
-        (["mi300x"], 1.3074e15),
-        (["mi300a"], 980.6e12),
-        (["mi250x"], 383e12),
-        (["mi250"], 362.1e12),
-        # Consumer RTX
-        (["5090"], 209.5e12),
         (["4090"], 165.2e12),
-        (["3090"], 71e12),
     )
     for patterns, flops in _PEAK_FLOPS_TABLE:
         if all(p in name for p in patterns):
             return flops
-    if "data center gpu max 1550" in name:
-        # Ponte Vecchio (PVC) - dynamic based on compute units
-        max_comp_units = torch.xpu.get_device_properties("xpu").max_compute_units
-        return 512 * max_comp_units * 1300 * 10**6
 
-    # Unknown GPU - return inf so MFU shows as 0% rather than a wrong guess
+    # Unknown device - return inf so MFU shows as 0% rather than a wrong guess
     logger.warning(f"Peak flops undefined for: {device_name}, MFU will show as 0%")
     return float('inf')
+
+def get_device_name() -> str:
+    """Get a human-readable device name for the current accelerator."""
+    backend = jax.default_backend()
+    if backend == 'tpu':
+        # JAX exposes TPU type info
+        device = jax.devices()[0]
+        return f"TPU {device.device_kind}"
+    elif backend == 'gpu':
+        device = jax.devices()[0]
+        return str(device.device_kind)
+    else:
+        return backend.upper()

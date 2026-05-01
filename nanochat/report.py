@@ -10,7 +10,7 @@ import socket
 import datetime
 import platform
 import psutil
-import torch
+import jax
 
 def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
@@ -41,26 +41,26 @@ def get_git_info():
 
     return info
 
-def get_gpu_info():
-    """Get GPU information."""
-    if not torch.cuda.is_available():
-        return {"available": False}
+def get_accelerator_info():
+    """Get accelerator (TPU/GPU/CPU) information via JAX."""
+    backend = jax.default_backend()
+    devices = jax.devices()
+    num_devices = len(devices)
 
-    num_devices = torch.cuda.device_count()
+    if backend == 'cpu':
+        return {"available": False, "backend": "cpu"}
+
     info = {
         "available": True,
+        "backend": backend,
         "count": num_devices,
-        "names": [],
-        "memory_gb": []
+        "names": list(set(str(d.device_kind) for d in devices)),
     }
 
-    for i in range(num_devices):
-        props = torch.cuda.get_device_properties(i)
-        info["names"].append(props.name)
-        info["memory_gb"].append(props.total_memory / (1024**3))
-
-    # Get CUDA version
-    info["cuda_version"] = torch.version.cuda or "unknown"
+    if backend == 'tpu':
+        info["type"] = f"TPU {devices[0].device_kind}"
+    elif backend == 'gpu':
+        info["type"] = str(devices[0].device_kind)
 
     return info
 
@@ -72,7 +72,7 @@ def get_system_info():
     info['hostname'] = socket.gethostname()
     info['platform'] = platform.system()
     info['python_version'] = platform.python_version()
-    info['torch_version'] = torch.__version__
+    info['jax_version'] = jax.__version__
 
     # CPU and memory
     info['cpu_count'] = psutil.cpu_count(logical=False)
@@ -86,34 +86,37 @@ def get_system_info():
 
     return info
 
-def estimate_cost(gpu_info, runtime_hours=None):
-    """Estimate training cost based on GPU type and runtime."""
+def estimate_cost(accel_info, runtime_hours=None):
+    """Estimate training cost based on accelerator type and runtime."""
 
-    # Rough pricing, from Lambda Cloud
+    # Rough pricing (on-demand)
     default_rate = 2.0
-    gpu_hourly_rates = {
+    hourly_rates = {
+        # GPUs
         "H100": 3.00,
         "A100": 1.79,
-        "V100": 0.55,
+        # TPUs (per chip, Google Cloud on-demand)
+        "v5e": 1.20,
+        "v4": 3.22,
+        "v5p": 4.20,
     }
 
-    if not gpu_info.get("available"):
+    if not accel_info.get("available"):
         return None
 
-    # Try to identify GPU type from name
     hourly_rate = None
-    gpu_name = gpu_info["names"][0] if gpu_info["names"] else "unknown"
-    for gpu_type, rate in gpu_hourly_rates.items():
-        if gpu_type in gpu_name:
-            hourly_rate = rate * gpu_info["count"]
+    accel_name = accel_info["names"][0] if accel_info["names"] else "unknown"
+    for accel_type, rate in hourly_rates.items():
+        if accel_type.lower() in accel_name.lower():
+            hourly_rate = rate * accel_info["count"]
             break
 
     if hourly_rate is None:
-        hourly_rate = default_rate * gpu_info["count"]  # Default estimate
+        hourly_rate = default_rate * accel_info["count"]
 
     return {
         "hourly_rate": hourly_rate,
-        "gpu_type": gpu_name,
+        "accel_type": accel_name,
         "estimated_total": hourly_rate * runtime_hours if runtime_hours else None
     }
 
@@ -122,9 +125,9 @@ def generate_header():
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     git_info = get_git_info()
-    gpu_info = get_gpu_info()
+    accel_info = get_accelerator_info()
     sys_info = get_system_info()
-    cost_info = estimate_cost(gpu_info)
+    cost_info = estimate_cost(accel_info)
 
     header = f"""# nanochat training report
 
@@ -143,15 +146,12 @@ Generated: {timestamp}
 - Memory: {sys_info['memory_gb']:.1f} GB
 """
 
-    if gpu_info.get("available"):
-        gpu_names = ", ".join(set(gpu_info["names"]))
-        total_vram = sum(gpu_info["memory_gb"])
-        header += f"""- GPUs: {gpu_info['count']}x {gpu_names}
-- GPU Memory: {total_vram:.1f} GB total
-- CUDA Version: {gpu_info['cuda_version']}
+    if accel_info.get("available"):
+        accel_names = ", ".join(accel_info["names"])
+        header += f"""- Accelerators: {accel_info['count']}x {accel_names} ({accel_info['backend']})
 """
     else:
-        header += "- GPUs: None available\n"
+        header += "- Accelerators: None (CPU only)\n"
 
     if cost_info and cost_info["hourly_rate"] > 0:
         header += f"""- Hourly Rate: ${cost_info['hourly_rate']:.2f}/hour\n"""
@@ -159,7 +159,7 @@ Generated: {timestamp}
     header += f"""
 ### Software
 - Python: {sys_info['python_version']}
-- PyTorch: {sys_info['torch_version']}
+- JAX: {sys_info['jax_version']}
 
 """
 
@@ -400,8 +400,8 @@ class DummyReport:
 def get_report():
     # just for convenience, only rank 0 logs to report
     from nanochat.common import get_base_dir, get_dist_info
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if ddp_rank == 0:
+    num_devices, proc_idx, proc_count = get_dist_info()
+    if proc_idx == 0:
         report_dir = os.path.join(get_base_dir(), "report")
         return Report(report_dir)
     else:
