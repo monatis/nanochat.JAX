@@ -155,31 +155,31 @@ class CausalSelfAttention(nnx.Module):
         q = q * 1.2  # sharper attention
         k = k * 1.2
 
-        # Attention via jax.nn.dot_product_attention
-        # On TPU this automatically uses Splash Attention (the TPU equivalent of Flash Attention)
-        # Transpose to (B, H, T, D) for the attention function
+        # Handle GQA: repeat k,v heads to match q heads
+        if self.n_kv_head < self.n_head:
+            repeats = self.n_head // self.n_kv_head
+            k = jnp.repeat(k, repeats, axis=2)
+            v = jnp.repeat(v, repeats, axis=2)
+
+        # Transpose to (B, H, T, D) for jax.nn.dot_product_attention
+        # This ensures the last two dims are (Seq, Dim)
         q = jnp.transpose(q, (0, 2, 1, 3))
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
 
-        # Handle GQA: repeat k,v heads to match q heads
-        if self.n_kv_head < self.n_head:
-            repeats = self.n_head // self.n_kv_head
-            k = jnp.repeat(k, repeats, axis=1)
-            v = jnp.repeat(v, repeats, axis=1)
-
         # Build attention mask
         if window_size < 0:
-            # Full causal attention — use is_causal flag
+            # Full causal attention
             y = jax.nn.dot_product_attention(q, k, v, is_causal=True)
         else:
             # Sliding window: need explicit mask
             mask = _make_sliding_window_mask(T, window_size)
-            # Broadcast mask to (1, 1, T, T) for attention
-            bias = jnp.where(mask[None, None, :, :], 0.0, jnp.finfo(q.dtype).min)
+            # Explicitly shape bias to (1, 1, T, T) for broadcasting with (B, H, T, T) scores
+            bias = jnp.where(mask, 0.0, jnp.finfo(q.dtype).min)
+            bias = jnp.expand_dims(bias, (0, 1))
             y = jax.nn.dot_product_attention(q, k, v, bias=bias)
 
-        # Transpose back to (B, T, H, D) and project
+        # Transpose back to (B, T, H, D)
         y = jnp.transpose(y, (0, 2, 1, 3))
         y = y.reshape(B, T, -1)
         y = self.c_proj(y)
