@@ -524,7 +524,7 @@ class GPT(nnx.Module):
             if temperature > 0:
                 logits = logits / temperature
                 key, subkey = jax.random.split(key)
-                next_ids = jax.random.categorical(subkey, logits, axis=-1)[None]  # (1,)
+                next_ids = jax.random.categorical(subkey, logits, axis=-1)  # (1,)
                 next_ids = next_ids[:, None]  # (1, 1)
             else:
                 next_ids = jnp.argmax(logits, axis=-1, keepdims=True)  # (1, 1)

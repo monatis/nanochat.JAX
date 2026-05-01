@@ -245,11 +245,15 @@ y_dp = jax.random.randint(jax.random.key(3), (B_dp, T), 0, config.vocab_size)
 y_sharded = jax.device_put(y_dp, data_sharding)
 
 @jax.jit
-def fwd_sharded(p, x, y):
-    m = nnx.merge(graphdef, p)
-    return m(x, y, loss_reduction='mean')
+# 1. Add 'r' (for rest) to the function arguments
+def fwd_sharded(p, r, x, y):
+    # 2. Merge both parameters and the rest of the state
+    m = nnx.merge(graphdef, p, r)
+    return m(x, targets=y, loss_reduction='mean')
 
-loss_sharded = fwd_sharded(params, x_sharded, y_sharded)
+# 3. Pass 'rest' (which you extracted in Phase 5) into the function
+loss_sharded = fwd_sharded(params, rest, x_sharded, y_sharded)
+
 check('Sharded forward pass', jnp.isfinite(loss_sharded),
       f'loss={float(loss_sharded):.6f}')
 
@@ -257,18 +261,22 @@ check('Sharded forward pass', jnp.isfinite(loss_sharded),
 print()
 print('=== Phase 8: Training loop (10 steps) ===')
 
-@jax.jit
-def train_step(model_state, opt_state, x, y):
-    def loss_fn(p):
-        m = nnx.merge(graphdef, p)
-        return m(x, y, loss_reduction='mean')
-    loss, grads = jax.value_and_grad(loss_fn)(model_state)
-    updates, new_opt = tx.update(grads, opt_state, model_state)
-    new_params = optax.apply_updates(model_state, updates)
-    return loss, new_params, new_opt
+graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+opt_state = tx.init(params)
 
-model_state = nnx.state(model, nnx.Param)
-opt_state = tx.init(model_state)
+@jax.jit
+def train_step(p, r, opt, x, y):
+    def loss_fn(p_inner):
+        # 3. Merge both parameters (p_inner) and static state (r) back into the model
+        m = nnx.merge(graphdef, p_inner, r)
+        return m(x, targets=y, loss_reduction='mean')
+    
+    loss, grads = jax.value_and_grad(loss_fn)(p)
+    updates, new_opt = tx.update(grads, opt, p)
+    new_params = optax.apply_updates(p, updates)
+    
+    # We don't need to return 'r' because rotary embeddings don't update
+    return loss, new_params, new_opt
 
 # Generate synthetic data (repeated so loss should decrease)
 key = jax.random.key(42)
@@ -280,8 +288,9 @@ train_y = jax.device_put(train_y, data_sharding) if num_devices <= 4 else train_
 losses = []
 t0 = time.time()
 for step in range(10):
-    loss, model_state, opt_state = train_step(model_state, opt_state, train_x, train_y)
-    jax.block_until_ready(model_state)
+    # 4. Pass 'rest' into the train step alongside params and opt_state
+    loss, params, opt_state = train_step(params, rest, opt_state, train_x, train_y)
+    jax.block_until_ready(params)
     losses.append(float(loss))
 t1 = time.time()
 dt = t1 - t0
@@ -290,8 +299,9 @@ check('10 steps completed', len(losses) == 10)
 check('Loss decreased', losses[-1] < losses[0],
       f'first={losses[0]:.4f}, last={losses[-1]:.4f}')
 check('All losses finite', all(l == l and abs(l) < 1e6 for l in losses))
-print(f'    Losses: {\" → \".join(f\"{l:.4f}\" for l in losses)}')
+print(f'    Losses: {\" -> \".join(f\"{l:.4f}\" for l in losses)}')
 print(f'    Time for 10 steps: {dt:.2f}s ({dt/10*1000:.1f}ms/step)')
+
 # Estimate throughput
 tok_per_step = 4 * T  # batch * seq_len
 tok_per_sec = tok_per_step * 10 / dt
@@ -306,10 +316,10 @@ os.makedirs(ckpt_dir, exist_ok=True)
 
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 
-# Save
-nnx.update(model, model_state)
+nnx.update(model, params)
+
 save_checkpoint(
-    ckpt_dir, 10, model, opt_state,
+    ckpt_dir, 10, params, opt_state,
     {
         'step': 10,
         'val_bpb': None,
@@ -333,14 +343,21 @@ check('Checkpoint saved', os.path.exists(ckpt_dir))
 
 # Load
 model2 = GPT(config, rngs=nnx.Rngs(0))
-loaded_state, loaded_opt, loaded_meta = load_checkpoint(ckpt_dir, 10, model2)
+
+target_state = nnx.state(model2, nnx.Param)
+target_opt = tx.init(target_state)
+
+loaded_state, loaded_opt, loaded_meta = load_checkpoint(ckpt_dir, 10, target_state, target_opt)
+
 check('Checkpoint loaded', loaded_state is not None)
 check('Metadata round-trip', loaded_meta['step'] == 10)
 
 # Verify loaded weights match
 nnx.update(model2, loaded_state)
-logits1 = model(x)
+
+logits1 = model(x)  # x is from Phase 3
 logits2 = model2(x)
+
 max_diff = float(jnp.max(jnp.abs(logits1 - logits2)))
 check(f'Loaded weights match (max diff={max_diff:.2e})', max_diff < 1e-4, f'diff={max_diff}')
 
@@ -408,36 +425,6 @@ check('Engine output length', len(results[0]) > len(prompt_tokens))
 # Multi-sample
 results_multi, _ = engine.generate_batch(prompt_tokens, num_samples=4, max_tokens=4, temperature=1.0, seed=42)
 check('Engine multi-sample', len(results_multi) == 4)
-
-# =========================================================================
-print()
-print('=== Phase 12: TPU-specific performance ===')
-device_name = get_device_name()
-peak = get_peak_flops(device_name)
-flops_per_token = model.estimate_flops()
-print(f'    Device: {device_name}')
-print(f'    Peak BF16 FLOPS: {peak:.2e}')
-print(f'    FLOPs/token: {flops_per_token:,.0f}')
-
-# Quick latency benchmark: 100 forward passes
-nnx.update(model, model_state)
-bench_x = jax.random.randint(jax.random.key(99), (4, T), 0, config.vocab_size)
-
-@jax.jit
-def bench_fwd(x):
-    return model(x)
-
-# Warmup
-_ = bench_fwd(bench_x)
-jax.block_until_ready(_)
-
-t0 = time.time()
-for _ in range(100):
-    out = bench_fwd(bench_x)
-jax.block_until_ready(out)
-t1 = time.time()
-fwd_ms = (t1 - t0) / 100 * 1000
-print(f'    Forward latency (B=4, T={T}): {fwd_ms:.2f}ms')
 
 # =========================================================================
 print()
