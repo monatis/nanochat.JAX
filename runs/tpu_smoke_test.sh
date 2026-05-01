@@ -173,14 +173,22 @@ check('Per-token loss shape', loss_per_tok.shape == (B, T),
 # =========================================================================
 print()
 print('=== Phase 5: Backward pass (gradient computation) ===')
-params = nnx.state(model, nnx.Param)
-graphdef = nnx.graphdef(model)
 
-def loss_fn(p):
-    m = nnx.merge(graphdef, p)
-    return m(x, y, loss_reduction='mean')
+# Generate some dummy targets if you haven't already
+y = jax.random.randint(key, (B, T), 0, config.vocab_size) 
 
-loss_val, grads = jax.value_and_grad(loss_fn)(params)
+# 1. Use nnx.split to separate graph, parameters, and all other state (cos/sin)
+graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+
+def loss_fn(p, r):
+    # 2. Merge everything back together inside the function
+    m = nnx.merge(graphdef, p, r)
+    # Using targets=y as per your GPT __call__ signature
+    return m(x, targets=y, loss_reduction='mean')
+
+# 3. jax.value_and_grad differentiates wrt argnums=0 (params) by default
+loss_val, grads = jax.value_and_grad(loss_fn)(params, rest)
+
 check('Grad loss finite', jnp.isfinite(loss_val))
 
 # Check gradients are not all zero

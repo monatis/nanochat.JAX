@@ -79,7 +79,9 @@ def _normuon_variance_reduction(g, second_moment, beta2):
     v_norm = jnp.sqrt(v_norm_sq)
 
     # EMA update of second moment
-    new_second_moment = second_moment * beta2 + v_mean.astype(second_moment.dtype) * (1 - beta2)
+    new_second_moment = second_moment * beta2 + v_mean.astype(second_moment.dtype) * (
+        1 - beta2
+    )
 
     # Compute per-neuron step size
     step_size = jax.lax.rsqrt(jnp.maximum(new_second_moment, 1e-10))
@@ -161,9 +163,12 @@ def muon(
             return update, new_mom, new_sec_mom
 
         new_updates, new_mom_buf, new_sec_mom = jax.tree.map(
-            _muon_update, updates, momentum_buf, second_moment,
+            _muon_update,
+            updates,
+            momentum_buf,
+            second_moment,
             params if params is not None else jax.tree.map(jnp.zeros_like, updates),
-            is_leaf=lambda x: isinstance(x, jnp.ndarray) or hasattr(x, 'shape'),
+            is_leaf=lambda x: isinstance(x, jnp.ndarray) or hasattr(x, "shape"),
         )
 
         return new_updates, (new_mom_buf, new_sec_mom)
@@ -173,22 +178,23 @@ def muon(
 
 # --- Parameter grouping utilities ---
 
+
 def classify_param(path: str, param) -> str:
     """
     Classify a parameter into an optimizer group based on its path in the model.
     Returns one of: 'muon', 'embed', 'lm_head', 'scalars'
     """
     # Embedding layers -> adamw
-    if 'wte' in path or 'value_embeds' in path:
-        return 'embed'
+    if "wte" in path or "value_embeds" in path:
+        return "embed"
     # LM head -> adamw
-    if 'lm_head' in path:
-        return 'lm_head'
+    if "lm_head" in path:
+        return "lm_head"
     # 2D weight matrices in transformer blocks -> muon
-    if param.ndim == 2 and 'blocks' in path:
-        return 'muon'
+    if param.ndim == 2 and "blocks" in path:
+        return "muon"
     # Everything else (scalars, 1D, gates, lambdas) -> adamw/scalars
-    return 'scalars'
+    return "scalars"
 
 
 def build_optimizer(model, config):
@@ -203,69 +209,80 @@ def build_optimizer(model, config):
             - adamw_lm_head_lr, adamw_lm_head_betas, adamw_lm_head_eps, adamw_lm_head_wd
             - adamw_scalars_lr, adamw_scalars_betas, adamw_scalars_eps, adamw_scalars_wd
     """
+    import jax
+    import optax
     from flax import nnx
+
+    # Assuming muon and classify_param are available in your namespace
+    # from nanochat.optim import muon, classify_param
 
     # Default hyperparams (matching PyTorch nanochat defaults)
     c = {
-        'muon_lr': 0.02,
-        'muon_momentum': 0.95,
-        'muon_ns_steps': 5,
-        'muon_beta2': 0.999,
-        'muon_wd': 0.0,
-        'adamw_embed_lr': 0.3,
-        'adamw_embed_betas': (0.8, 0.95),
-        'adamw_embed_eps': 1e-10,
-        'adamw_embed_wd': 0.0,
-        'adamw_lm_head_lr': 0.008,
-        'adamw_lm_head_betas': (0.8, 0.95),
-        'adamw_lm_head_eps': 1e-10,
-        'adamw_lm_head_wd': 0.0,
-        'adamw_scalars_lr': 0.5,
-        'adamw_scalars_betas': (0.8, 0.95),
-        'adamw_scalars_eps': 1e-10,
-        'adamw_scalars_wd': 0.0,
+        "muon_lr": 0.02,
+        "muon_momentum": 0.95,
+        "muon_ns_steps": 5,
+        "muon_beta2": 0.999,
+        "muon_wd": 0.0,
+        "adamw_embed_lr": 0.3,
+        "adamw_embed_betas": (0.8, 0.95),
+        "adamw_embed_eps": 1e-10,
+        "adamw_embed_wd": 0.0,
+        "adamw_lm_head_lr": 0.008,
+        "adamw_lm_head_betas": (0.8, 0.95),
+        "adamw_lm_head_eps": 1e-10,
+        "adamw_lm_head_wd": 0.0,
+        "adamw_scalars_lr": 0.5,
+        "adamw_scalars_betas": (0.8, 0.95),
+        "adamw_scalars_eps": 1e-10,
+        "adamw_scalars_wd": 0.0,
     }
     c.update(config)
 
     # Build the multi-transform optimizer
     transforms = {
-        'muon': muon(
-            learning_rate=c['muon_lr'],
-            momentum=c['muon_momentum'],
-            ns_steps=c['muon_ns_steps'],
-            beta2=c['muon_beta2'],
-            weight_decay=c['muon_wd'],
+        "muon": muon(
+            learning_rate=c["muon_lr"],
+            momentum=c["muon_momentum"],
+            ns_steps=c["muon_ns_steps"],
+            beta2=c["muon_beta2"],
+            weight_decay=c["muon_wd"],
         ),
-        'embed': optax.adamw(
-            learning_rate=c['adamw_embed_lr'],
-            b1=c['adamw_embed_betas'][0],
-            b2=c['adamw_embed_betas'][1],
-            eps=c['adamw_embed_eps'],
-            weight_decay=c['adamw_embed_wd'],
+        "embed": optax.adamw(
+            learning_rate=c["adamw_embed_lr"],
+            b1=c["adamw_embed_betas"][0],
+            b2=c["adamw_embed_betas"][1],
+            eps=c["adamw_embed_eps"],
+            weight_decay=c["adamw_embed_wd"],
         ),
-        'lm_head': optax.adamw(
-            learning_rate=c['adamw_lm_head_lr'],
-            b1=c['adamw_lm_head_betas'][0],
-            b2=c['adamw_lm_head_betas'][1],
-            eps=c['adamw_lm_head_eps'],
-            weight_decay=c['adamw_lm_head_wd'],
+        "lm_head": optax.adamw(
+            learning_rate=c["adamw_lm_head_lr"],
+            b1=c["adamw_lm_head_betas"][0],
+            b2=c["adamw_lm_head_betas"][1],
+            eps=c["adamw_lm_head_eps"],
+            weight_decay=c["adamw_lm_head_wd"],
         ),
-        'scalars': optax.adamw(
-            learning_rate=c['adamw_scalars_lr'],
-            b1=c['adamw_scalars_betas'][0],
-            b2=c['adamw_scalars_betas'][1],
-            eps=c['adamw_scalars_eps'],
-            weight_decay=c['adamw_scalars_wd'],
+        "scalars": optax.adamw(
+            learning_rate=c["adamw_scalars_lr"],
+            b1=c["adamw_scalars_betas"][0],
+            b2=c["adamw_scalars_betas"][1],
+            eps=c["adamw_scalars_eps"],
+            weight_decay=c["adamw_scalars_wd"],
         ),
     }
 
-    # Build the label function that maps each parameter path to its optimizer group
-    def label_fn(path, _):
-        # path is a tuple of strings like ('blocks', '0', 'attn', 'c_q', 'kernel')
-        path_str = '.'.join(str(p) for p in path)
-        # We need to get the param from the model to check ndim
-        # but label_fn only gets path and leaf, leaf IS the param
-        return classify_param(path_str, _)
+    # Build the label function that maps the ENTIRE params tree to a tree of labels
+    def map_labels(params_tree):
 
-    tx = optax.multi_transform(transforms, label_fn)
+        def get_label_for_leaf(path, leaf):
+            # JAX paths are tuples of keys. We extract the string name from each key
+            # to reconstruct the dotted path string (e.g., "blocks.0.attn.c_q.kernel")
+            path_str = ".".join(
+                str(p.key) if hasattr(p, "key") else str(p) for p in path
+            )
+            return classify_param(path_str, leaf)
+
+        # Apply our leaf logic over the PyTree
+        return jax.tree_util.tree_map_with_path(get_label_for_leaf, params_tree)
+
+    tx = optax.multi_transform(transforms, map_labels)
     return tx
