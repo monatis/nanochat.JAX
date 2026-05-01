@@ -11,6 +11,10 @@ For example, you can train your own GPT-2 capability LLM for only a few dollars 
 
 Even though there exist multiple attempts to port NanoChat to JAX, they are either not kept up-to-date with the latest JAX/Flax NNX API changes, or they are . incomplete in the sense that they do not cover the entire LLM lifecycle (tokenization, pretraining, finetuning, evaluation, inference, and a chat UI). By porting the original NanoChat repo to JAX while keeping the code minimal and readable, I aim to to about provide the same experience of training LLMs as the original NanoChat repo does, but with the performance benefits of JAX.
 
+You can run comprehensive smoke tests on Colab
+
+![Open in Colab](https://colab.research.google.com/drive/1A18X0qYeTYWxg9YN-ESMTsgqGI7vgA9T?usp=sharing)
+
 ## Getting started
 
 ### Setup
