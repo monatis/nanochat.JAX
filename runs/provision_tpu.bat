@@ -27,7 +27,7 @@ REM ---------------------------------------------------------------------------
 REM Configuration (override by setting environment variables before running)
 REM ---------------------------------------------------------------------------
 
-if not defined ZONE         set "ZONE=us-central1-a"
+if not defined ZONE         set "ZONE=southamerica-east1-c"
 if not defined TPU_TYPE     set "TPU_TYPE=v6e-1"
 if not defined RUNTIME      set "RUNTIME=v2-alpha-tpuv6e"
 if not defined DURATION     set "DURATION=2h"
